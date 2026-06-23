@@ -37,13 +37,21 @@ class CameraBridgeFragment : CameraFragment() {
     /** When true, incoming frames are also scanned for a QR code. */
     @Volatile var qrScanning: Boolean = false
     private val qrDecoder = com.scannerbridge.bridge.util.QrDecoder()
-    @Volatile private var qrBusy = false
+    private val qrBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var lastQrText: String? = null
+    @Volatile private var lastQrAttemptMs = 0L
+    // Single background thread for QR decoding so it never blocks the camera.
+    private val qrExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    // Decode at most ~4x/second; plenty for pairing, light on CPU.
+    private val qrIntervalMs = 250L
 
     private var binding: FragmentCameraBinding? = null
 
-    private val reqWidth = 1280
-    private val reqHeight = 720
+    // 640x480 is the most universally supported UVC mode and tends to be
+    // brighter and undistorted (the webcam's native mode), which is what the
+    // QR decoder needs. Higher modes often force a darker/cropped fallback.
+    private val reqWidth = 640
+    private val reqHeight = 480
 
     @Volatile private var frameW = reqWidth
     @Volatile private var frameH = reqHeight
@@ -81,30 +89,42 @@ class CameraBridgeFragment : CameraFragment() {
                 format: IPreviewDataCallBack.DataFormat
             ) {
                 if (data == null) return
-                if (format == IPreviewDataCallBack.DataFormat.NV21) {
-                    val w = if (width > 0) width else frameW
-                    val h = if (height > 0) height else frameH
-                    if (width > 0 && height > 0) {
-                        frameW = width
-                        frameH = height
-                    }
-                    frameBridge?.let {
-                        it.setResolution(w, h)
-                        it.onFrame(data, w, h)
-                    }
-                    if (qrScanning && !qrBusy) {
-                        qrBusy = true
-                        // Decode on this callback thread; QR decode of one
-                        // frame is cheap and we gate re-entry with qrBusy.
-                        try {
-                            val text = qrDecoder.decodeNv21(data, w, h)
-                            if (text != null && text != lastQrText) {
-                                lastQrText = text
-                                callbacks?.onQrDecoded(text)
-                            }
-                        } finally {
-                            qrBusy = false
+                if (format != IPreviewDataCallBack.DataFormat.NV21) return
+
+                val w = if (width > 0) width else frameW
+                val h = if (height > 0) height else frameH
+                if (width > 0 && height > 0) {
+                    frameW = width
+                    frameH = height
+                }
+                // Streaming bridge is light (just hands off bytes) — fine here.
+                frameBridge?.let {
+                    it.setResolution(w, h)
+                    it.onFrame(data, w, h)
+                }
+
+                // QR decode is HEAVY. Never run it on this callback thread (it
+                // freezes the camera pipeline -> 0 fps + ANR). Hand a single
+                // copied frame to a background worker, throttled, dropping
+                // frames while one is in flight.
+                if (!qrScanning) return
+                val now = System.currentTimeMillis()
+                if (now - lastQrAttemptMs < qrIntervalMs) return
+                if (!qrBusy.compareAndSet(false, true)) return
+                lastQrAttemptMs = now
+
+                val copy = data.copyOf()        // copy once, off-buffer
+                val cw = w; val ch = h
+                qrExecutor.execute {
+                    try {
+                        val text = qrDecoder.decodeNv21(copy, cw, ch)
+                        if (text != null && text != lastQrText) {
+                            lastQrText = text
+                            activity?.runOnUiThread { callbacks?.onQrDecoded(text) }
                         }
+                    } catch (_: Throwable) {
+                    } finally {
+                        qrBusy.set(false)
                     }
                 }
             }
@@ -158,6 +178,7 @@ class CameraBridgeFragment : CameraFragment() {
     }
 
     override fun onDestroyView() {
+        try { qrExecutor.shutdownNow() } catch (_: Throwable) {}
         binding = null
         super.onDestroyView()
     }
