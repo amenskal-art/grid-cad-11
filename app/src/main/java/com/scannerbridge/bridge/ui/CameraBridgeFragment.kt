@@ -1,213 +1,120 @@
-package com.scannerbridge.bridge.ui
+package com.amenskal.gridcad11.ui
 
+import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import com.jiangdg.ausbc.MultiCameraClient
-import com.jiangdg.ausbc.base.CameraFragment
-import com.jiangdg.ausbc.callback.ICameraStateCallBack
-import com.jiangdg.ausbc.callback.IPreviewDataCallBack
-import com.jiangdg.ausbc.camera.bean.CameraRequest
-import com.jiangdg.ausbc.render.env.RotateType
-import com.jiangdg.ausbc.widget.IAspectRatio
-import com.scannerbridge.bridge.databinding.FragmentCameraBinding
-import com.scannerbridge.bridge.server.FrameBridge
+import android.widget.TextView
+import androidx.fragment.app.Fragment
+import com.amenskal.gridcad11.R
+import com.amenskal.gridcad11.server.FrameBridge
+import com.amenskal.gridcad11.server.MjpegServer
+import com.amenskal.gridcad11.server.StreamForegroundService
+import com.serenegiant.usb.USBMonitor
+import com.serenegiant.usb.common.UVCCameraHandler
+import com.serenegiant.usb.widget.CameraViewInterface
+import java.nio.ByteBuffer
 
-/**
- * Hosts the AUSBC UVC camera and forwards each raw preview frame (NV21) to a
- * [FrameBridge].
- *
- * NOTE on the callback signature: AUSBC 3.x delivers preview data via
- *   onPreviewData(data: ByteArray?, format: DataFormat)
- * (two args -- dimensions are NOT passed). We therefore track the live
- * resolution ourselves from the camera's negotiated preview size on open,
- * and fall back to the requested size.
- */
-class CameraBridgeFragment : CameraFragment() {
+class CameraBridgeFragment : Fragment(), CameraViewInterface.OnFrameCapturedCallback {
 
-    interface Callbacks {
-        fun onCameraOpened(width: Int, height: Int)
-        fun onCameraClosed()
-        fun onQrDecoded(text: String)
+    private lateinit var usbMonitor: USBMonitor
+    private lateinit var cameraHandler: UVCCameraHandler
+    private lateinit var cameraView: CameraViewInterface
+    private lateinit var statusText: TextView
+
+    private val frameBridge = FrameBridge()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        StreamForegroundService.start(requireContext())
+
+        // CameraView is inflated from layout, but we need it for handler creation.
+        // We'll defer handler creation until onViewCreated where cameraView is available.
     }
 
-    var callbacks: Callbacks? = null
-    @Volatile var frameBridge: FrameBridge? = null
-
-    /** When true, incoming frames are also scanned for a QR code. */
-    @Volatile var qrScanning: Boolean = false
-    private val qrDecoder = com.scannerbridge.bridge.util.QrDecoder()
-    private val qrBusy = java.util.concurrent.atomic.AtomicBoolean(false)
-    @Volatile private var lastQrText: String? = null
-    @Volatile private var lastQrAttemptMs = 0L
-    // Single background thread for QR decoding so it never blocks the camera.
-    private val qrExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
-    // Decode at most ~4x/second; plenty for pairing, light on CPU.
-    private val qrIntervalMs = 250L
-
-    private var binding: FragmentCameraBinding? = null
-
-    // 640x480 is the most universally supported UVC mode and tends to be
-    // brighter and undistorted (the webcam's native mode), which is what the
-    // QR decoder needs. Higher modes often force a darker/cropped fallback.
-    private val reqWidth = 640
-    private val reqHeight = 480
-
-    @Volatile private var frameW = reqWidth
-    @Volatile private var frameH = reqHeight
-
-    override fun getRootView(inflater: LayoutInflater, container: ViewGroup?): View {
-        val b = FragmentCameraBinding.inflate(inflater, container, false)
-        binding = b
-        return b.root
+    override fun onCreateView(
+        inflater: LayoutInflater, container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View? {
+        return inflater.inflate(R.layout.fragment_camera_bridge, container, false)
     }
 
-    override fun getCameraView(): IAspectRatio? = binding?.cameraRender
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        cameraView = view.findViewById(R.id.cameraView)
+        statusText = view.findViewById(R.id.statusText)
 
-    override fun getCameraViewContainer(): ViewGroup? = binding?.cameraContainer
+        // Now create camera handler with the cameraView reference
+        cameraHandler = UVCCameraHandler.createHandler(
+            requireContext(),
+            cameraView,
+            UVCCameraHandler.createParams(1280, 720, 30),
+            this  // frame callback
+        )
 
-    override fun getCameraRequest(): CameraRequest {
-        return CameraRequest.Builder()
-            .setPreviewWidth(reqWidth)
-            .setPreviewHeight(reqHeight)
-            .setRenderMode(CameraRequest.RenderMode.OPENGL)
-            .setDefaultRotateType(RotateType.ANGLE_0)
-            .setAudioSource(CameraRequest.AudioSource.NONE)
-            .setAspectRatioShow(true)
-            .setCaptureRawImage(false)
-            .setRawPreviewData(true)
-            .create()
-    }
+        // Init USB monitor
+        usbMonitor = USBMonitor(requireContext(), object : USBMonitor.OnDeviceConnectListener {
+            override fun onAttach(device: android.hardware.usb.UsbDevice?) {
+                device?.let { usbMonitor.requestPermission(it) }
+            }
 
-    override fun initView() {
-        super.initView()
-        addPreviewDataCallBack(object : IPreviewDataCallBack {
-            override fun onPreviewData(
-                data: ByteArray?,
-                width: Int,
-                height: Int,
-                format: IPreviewDataCallBack.DataFormat
+            override fun onConnect(
+                device: android.hardware.usb.UsbDevice?,
+                ctrlBlock: USBMonitor.UsbControlBlock?
             ) {
-                if (data == null) return
-                if (format != IPreviewDataCallBack.DataFormat.NV21) return
+                cameraHandler.open(ctrlBlock)
+            }
 
-                val w = if (width > 0) width else frameW
-                val h = if (height > 0) height else frameH
-                if (width > 0 && height > 0) {
-                    frameW = width
-                    frameH = height
-                }
-                // Streaming bridge is light (just hands off bytes) — fine here.
-                frameBridge?.let {
-                    it.setResolution(w, h)
-                    it.onFrame(data, w, h)
-                }
+            override fun onDisconnect(
+                device: android.hardware.usb.UsbDevice?,
+                ctrlBlock: USBMonitor.UsbControlBlock?
+            ) {
+                cameraHandler.close()
+            }
 
-                // QR decode is HEAVY. Never run it on this callback thread (it
-                // freezes the camera pipeline -> 0 fps + ANR). Hand a single
-                // copied frame to a background worker, throttled, dropping
-                // frames while one is in flight.
-                if (!qrScanning) return
-                val now = System.currentTimeMillis()
-                if (now - lastQrAttemptMs < qrIntervalMs) return
-                if (!qrBusy.compareAndSet(false, true)) return
-                lastQrAttemptMs = now
+            override fun onDettach(device: android.hardware.usb.UsbDevice?) {
+                cameraHandler.close()
+            }
 
-                val copy = data.copyOf()        // copy once, off-buffer
-                val cw = w; val ch = h
-                qrExecutor.execute {
-                    try {
-                        val text = qrDecoder.decodeNv21(copy, cw, ch)
-                        if (text != null && text != lastQrText) {
-                            lastQrText = text
-                            activity?.runOnUiThread { callbacks?.onQrDecoded(text) }
-                        }
-                    } catch (_: Throwable) {
-                    } finally {
-                        qrBusy.set(false)
-                    }
-                }
+            override fun onCancel(device: android.hardware.usb.UsbDevice?) {
+                // permission denied
             }
         })
-    }
 
-    override fun onCameraState(
-        self: MultiCameraClient.ICamera,
-        code: ICameraStateCallBack.State,
-        msg: String?
-    ) {
-        when (code) {
-            ICameraStateCallBack.State.OPENED -> {
-                resolveActualPreviewSize()
-                frameBridge?.setResolution(frameW, frameH)
-                // Tell the TextureView the true aspect ratio so it letterboxes
-                // (fits) instead of stretching the feed to fill the view.
-                try {
-                    binding?.cameraRender?.setAspectRatio(frameW, frameH)
-                } catch (_: Throwable) {
-                }
-                callbacks?.onCameraOpened(frameW, frameH)
-            }
-            ICameraStateCallBack.State.CLOSED -> callbacks?.onCameraClosed()
-            ICameraStateCallBack.State.ERROR -> callbacks?.onCameraClosed()
+        // Start MJPEG server
+        MjpegServer.start(8080)
+
+        usbMonitor.register()
+        val list = usbMonitor.deviceList
+        if (list.isNotEmpty()) {
+            usbMonitor.requestPermission(list[0])
         }
     }
 
-    /**
-     * Ask the open camera for its negotiated preview size. Some devices ignore
-     * the requested size, so this keeps JPEG dimensions correct. Defensive:
-     * wrapped in try/catch because the exact getter varies across 3.x builds.
-     */
-    private fun resolveActualPreviewSize() {
-        try {
-            val cam = getCurrentCamera()
-            val sizes = cam?.getAllPreviewSizes()
-            if (!sizes.isNullOrEmpty()) {
-                // Prefer the size matching our request; else the largest.
-                val match = sizes.firstOrNull {
-                    it.width == reqWidth && it.height == reqHeight
-                } ?: sizes.maxByOrNull { it.width * it.height }
-                if (match != null) {
-                    frameW = match.width
-                    frameH = match.height
-                }
-            }
-        } catch (_: Throwable) {
-            // keep requested size
+    override fun onResume() {
+        super.onResume()
+        usbMonitor.register()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        usbMonitor.unregister()
+        cameraHandler.close()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        MjpegServer.stop()
+        StreamForegroundService.stop(requireContext())
+        usbMonitor.destroy()
+        frameBridge.release()
+    }
+
+    override fun onFrameCaptured(data: ByteBuffer, width: Int, height: Int) {
+        frameBridge.pushFrame(data.array(), width, height)
+        requireActivity().runOnUiThread {
+            statusText.text = "Streaming ${width}x${height}"
         }
-    }
-
-    override fun onDestroyView() {
-        try { qrExecutor.shutdownNow() } catch (_: Throwable) {}
-        binding = null
-        super.onDestroyView()
-    }
-
-    // ---- Camera controls (UVC) -------------------------------------------
-    // These proxy to AUSBC's CameraUVC control setters. Ranges are 0..100 in
-    // the UI; AUSBC accepts percentages for most of these. Each is wrapped so
-    // an unsupported control on a given webcam can't crash the app.
-
-    // NOTE: AUSBC's CameraUVC does NOT have setBrightness. To brighten a dark
-    // feed use gain + gamma + contrast instead (all confirmed in the API).
-    fun ctlSetContrast(v: Int) = safe { it.setContrast(v) }
-    fun ctlSetGain(v: Int) = safe { it.setGain(v) }
-    fun ctlSetGamma(v: Int) = safe { it.setGamma(v) }
-    fun ctlSetSaturation(v: Int) = safe { it.setSaturation(v) }
-    fun ctlSetSharpness(v: Int) = safe { it.setSharpness(v) }
-    fun ctlSetHue(v: Int) = safe { it.setHue(v) }
-    fun ctlSetZoom(v: Int) = safe { it.setZoom(v) }
-    fun ctlSetAutoFocus(on: Boolean) = safe { it.setAutoFocus(on) }
-    fun ctlSetAutoWhiteBalance(on: Boolean) = safe { it.setAutoWhiteBalance(on) }
-
-    private inline fun safe(block: (com.jiangdg.ausbc.camera.CameraUVC) -> Unit) {
-        try {
-            val cam = getCurrentCamera()
-            if (cam is com.jiangdg.ausbc.camera.CameraUVC) block(cam)
-        } catch (_: Throwable) { }
-    }
-
-    companion object {
-        fun newInstance() = CameraBridgeFragment()
     }
 }
